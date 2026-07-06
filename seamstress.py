@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import shutil
 import subprocess
 import sys
@@ -1188,6 +1189,45 @@ def concat_clips(paths: list[Path], out: Path, crf: int, preset: str) -> None:
 # --------------------------------------------------------------------------
 
 
+SEGMENT_VERSION_RE = re.compile(r"^(\d+)-(\d+)$")
+
+
+def select_versioned_takes(files: list[Path]) -> list[Path] | None:
+    """Resolve Sora-style versioned takes: SEGMENT-VERSION.mp4 (00-01, 00-02, 01-01...).
+
+    Returns one clip per segment in segment order, or None when the directory
+    does not follow the convention. Within a segment the newest take wins:
+    the highest version number, unless a lower-numbered take was modified
+    more recently (a re-render), in which case modification time decides.
+    """
+    segments: dict[int, list[tuple[int, Path]]] = {}
+    for path in files:
+        match = SEGMENT_VERSION_RE.match(path.stem)
+        if not match:
+            return None
+        segments.setdefault(int(match.group(1)), []).append((int(match.group(2)), path))
+    if len(segments) < 2:
+        return None
+
+    chosen: list[Path] = []
+    for segment in sorted(segments):
+        takes = segments[segment]
+        by_version = max(takes, key=lambda t: t[0])[1]
+        by_mtime = max(takes, key=lambda t: t[1].stat().st_mtime)[1]
+        pick, reason = by_version, "highest version"
+        if by_mtime != by_version and (
+            by_mtime.stat().st_mtime > by_version.stat().st_mtime + 60.0
+        ):
+            # A lower-numbered take was re-rendered well after the highest
+            # version existed; the fresher file is the one being iterated on.
+            pick, reason = by_mtime, "most recently updated"
+        if len(takes) > 1:
+            others = ", ".join(p.name for _, p in sorted(takes) if p != pick)
+            print(f"segment {segment:02d}: using {pick.name} ({reason}; skipping {others})")
+        chosen.append(pick)
+    return chosen
+
+
 def expand_clip_args(items: list[Path], sort: str) -> list[Path]:
     clips: list[Path] = []
     for item in items:
@@ -1203,7 +1243,8 @@ def expand_clip_args(items: list[Path], sort: str) -> list[Path]:
             )
             if not found:
                 raise RuntimeError(f"no video files found in directory: {path}")
-            clips.extend(found)
+            versioned = select_versioned_takes(found)
+            clips.extend(versioned if versioned else found)
         else:
             if not path.is_file():
                 raise RuntimeError(f"not found: {path}")

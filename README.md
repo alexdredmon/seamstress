@@ -78,6 +78,14 @@ order. With more than two clips, Seamstress chains: each seam is measured
 against the *corrected* predecessor, so corrections compound properly across
 a long take.
 
+Directories that follow the Sora `vid_clips` naming convention —
+`SEGMENT-VERSION.mp4`, e.g. `00-01.mp4`, `00-02.mp4`, `01-01.mp4` — are
+resolved automatically: one take per segment, chained in segment order. The
+highest version of each segment wins unless a lower-numbered take was
+modified meaningfully later (a re-render), in which case the fresher file is
+used. Every choice is printed, and you can always pass explicit files to
+override.
+
 For each corrected clip it writes:
 
 ```text
