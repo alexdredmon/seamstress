@@ -1,197 +1,138 @@
 # Seamstress
 
-Seamstress makes the cut between two separately generated clips of the same
-continuous shot feel seamless. It measures the boundary frames, estimates the
-spatial and color mismatch, re-renders one of the two clips, and applies a short
-residual ramp so the frame at the cut lands on the reference frame.
-
-The tool has one CLI entrypoint:
-
-```sh
-./seamstress.py PREVIOUS_CLIP NEXT_CLIP [options]
-```
-
-`PREVIOUS_CLIP` is the earlier clip in the timeline. `NEXT_CLIP` is the later
-clip in the timeline.
-
-## Requirements
-
-Install the Python dependencies:
-
-```sh
-python -m pip install -r requirements.txt
-```
-
-Install `ffmpeg` and `ffprobe` separately and make sure both commands are on
-`PATH`.
-
-The input clips must have the same frame width, frame height, and frame rate.
-The corrected output is encoded with `libx264`, `yuv420p`, and copied audio from
-the clip being altered when audio is present.
-
-## Quick Start
-
-Adjust the next clip so its first frame matches the previous clip's final frame:
+Seamstress makes the cuts between separately generated clips of one continuous
+shot invisible. Point it at two or more clips (or a whole directory) and it
+fixes every seam automatically — no configuration, no tuning:
 
 ```sh
 ./seamstress.py previous.mp4 next.mp4
 ```
 
-This writes:
-
-```text
-next_seamless.mp4
-next_seamless_report.json
-next_seamless_diagnostics/
+```sh
+./seamstress.py clip01.mp4 clip02.mp4 clip03.mp4 --concat final.mp4
 ```
-
-Preserve the next clip and adjust the previous clip's ending instead:
 
 ```sh
-./seamstress.py previous.mp4 next.mp4 --alter previous
+./seamstress.py my_take_folder/ --concat final.mp4
 ```
 
-This writes:
+It is built for the Seedance-style workflow where each clip is generated as a
+continuation of the previous clip's final frame and the generations come back
+with slightly different color grades, subtle spatial drift, and small changes
+to scene elements.
 
-```text
-previous_seamless.mp4
-previous_seamless_report.json
-previous_seamless_diagnostics/
-```
+## How it works
 
-Use explicit output paths when integrating with a larger pipeline:
+For every seam, Seamstress analyzes the boundary frame pair and fits a stack
+of corrections, each validated against the seam before it is kept:
+
+1. **Auto-conform.** If the clips differ in resolution or frame rate, the
+   altered clip is rescaled and retimed to match before analysis.
+2. **Global alignment.** A guarded ECC estimate finds the affine drift between
+   the generations (falling back to translation, then identity, and rejecting
+   implausible fits).
+3. **Dense correspondence.** DIS optical flow with a forward/backward
+   consistency check maps each pixel of one boundary frame onto the other.
+   Pixels that do not correspond — elements the new generation changed — are
+   detected and excluded from every fit, so the correction never tries to
+   force content that genuinely differs.
+4. **Three-layer color model**, fit only on validated corresponding pixels:
+   - a robust, outlier-trimmed RGB matrix solved in linear light,
+   - smooth confidence-weighted per-channel refinement curves,
+   - a spatially varying low-frequency residual field (masked, diffusion
+     inpainted, smoothed) that corrects region-dependent mismatch a global
+     transform cannot represent — vignetting, corner tints, uneven exposure.
+5. **Seam anchoring that travels with the content.** A decaying dense
+   geometric morph absorbs the subtle element shifts between the two
+   generations, and the remaining detail residual is advected frame by frame
+   with optical flow while it eases out. The boundary frame matches exactly
+   and the correction moves with the picture instead of ghosting over it —
+   the failure mode of static residual ramps.
+6. **Dithered re-render.** The alignment and color model apply to the whole
+   clip (so the grade stays consistent for the next seam in a chain); the
+   morph, field, and detail layers ease out on smoothstep schedules derived
+   from the frame rate. Frames are quantized with triangular-PDF dither to
+   prevent banding and encoded with libx264 at CRF 10 by default. Audio is
+   copied through untouched.
+
+Every stage measures the seam delta-E before and after itself and reverts to
+the safer model if it did not improve, so unusual footage degrades gracefully
+to simpler corrections instead of producing artifacts.
+
+## Requirements
 
 ```sh
-./seamstress.py previous.mp4 next.mp4 \
-  --output corrected-next.mp4 \
-  --report corrected-next-report.json \
-  --diagnostics-dir corrected-next-diagnostics
+python -m pip install -r requirements.txt
 ```
 
-## Choosing What To Alter
+`ffmpeg` and `ffprobe` must be on `PATH`.
 
-Use the default `--alter next` when the first clip is already approved and the
-later clip can be re-rendered. Seamstress compares:
+## Usage
 
 ```text
-previous final frame -> next first frame
+./seamstress.py CLIP [CLIP ...] [options]
 ```
 
-It then applies the correction to the next clip and fades the exact residual
-match out from frame 0 over `--anchor-frames`.
+Give clips in timeline order. Directories expand to their video files in name
+order. With more than two clips, Seamstress chains: each seam is measured
+against the *corrected* predecessor, so corrections compound properly across
+a long take.
 
-Use `--alter previous` when the later clip must remain untouched. Seamstress
-compares:
+For each corrected clip it writes:
 
 ```text
-previous final frame -> next first frame
+<clip>_seamless.mp4
+<clip>_seamless_report.json
+<clip>_seamless_diagnostics/
 ```
 
-It then applies the correction to the previous clip and fades the exact residual
-match into the final frame over `--anchor-frames`.
+The diagnostics directory includes `seam_preview_before_after.mp4` — the
+original seam on top, the corrected seam below, slowed 3x — so you can judge
+the fix in two seconds.
 
-## CLI Reference
+### Options
+
+- `--concat PATH`: also write the fully stitched timeline (first clip plus
+  all corrected clips).
+- `--outdir DIR`: put corrected clips, reports, and diagnostics here instead
+  of next to each input.
+- `-o, --output PATH`: explicit output path (two-clip mode only).
+- `--alter {next,previous}`: which side of the seam to re-render (two-clip
+  mode only). Default: `next` — the earlier clip is usually already approved.
+- `--sort {given,name,mtime}`: ordering for the clip list. Default: `given`.
+- `--blend-seconds SECONDS`: overall duration scale for easing the seam
+  corrections out. Default: `1.0`.
+- `--crf N` / `--preset NAME`: libx264 quality settings. Defaults: `10`,
+  `slow`.
+- `--no-diagnostics`: skip diagnostic PNGs and the preview video.
+- `--mask-margin PIXELS`, `--ecc-width PIXELS`, `--seed N`: analysis
+  internals; the defaults are right for essentially all footage.
+
+### Reading the output
+
+Each seam prints a one-line breakdown of how much every layer contributed,
+as mean Lab delta-E over the validated seam pixels:
 
 ```text
-usage: seamstress.py [-h] [--alter {next,previous}] [-o OUTPUT]
-                     [--report REPORT] [--diagnostics-dir DIAGNOSTICS_DIR]
-                     [--no-diagnostics] [--mask-margin MASK_MARGIN]
-                     [--ecc-width ECC_WIDTH] [--no-full-refine]
-                     [--trim-percentile TRIM_PERCENTILE]
-                     [--anchor-frames ANCHOR_FRAMES] [--crf CRF]
-                     [--preset PRESET]
-                     PREVIOUS_CLIP NEXT_CLIP
+seam dE mean: raw 11.87 -> matrix 4.89 -> curves 4.84 -> field 4.08 -> anchored 0.41
 ```
 
-Arguments:
-
-- `PREVIOUS_CLIP`: earlier clip in the timeline.
-- `NEXT_CLIP`: later clip in the timeline.
-
-Options:
-
-- `--alter {next,previous}`: choose which clip gets re-rendered. Default:
-  `next`.
-- `-o, --output PATH`: corrected clip path. Default: the altered input clip name
-  with `_seamless` before the extension.
-- `--report PATH`: JSON report path. Default: output name with `_report.json`.
-- `--diagnostics-dir PATH`: diagnostic PNG directory. Default: output name with
-  `_diagnostics`.
-- `--no-diagnostics`: skip diagnostic PNG output.
-- `--mask-margin PIXELS`: ignore this many pixels at each frame edge during
-  alignment and color solving. Default: `48`.
-- `--ecc-width PIXELS`: maximum working width for the initial ECC alignment
-  pass. Lower is faster; higher can help difficult matches. Default: `640`.
-- `--no-full-refine`: skip the full-resolution ECC refinement pass.
-- `--trim-percentile VALUE`: residual percentile kept while solving the robust
-  RGB color matrix. Lower values reject more outliers. Default: `75.0`.
-- `--anchor-frames N`: number of frames used for the residual seam ramp. Use `0`
-  to disable. Default: `6`.
-- `--crf N`: `libx264` quality. Lower is higher quality and larger output.
-  Default: `8`.
-- `--preset NAME`: `libx264` speed/compression preset. Default: `slow`.
-- `-h, --help`: show the full CLI help.
-
-## Outputs
-
-The corrected clip is the only video file Seamstress writes by default. It does
-not concatenate the two clips; put the untouched clip and corrected clip next to
-each other in your editor or downstream pipeline.
-
-The JSON report records:
-
-- input and output paths
-- which clip was altered
-- which boundary frame was used from each clip
-- ECC alignment score
-- affine transform matrix
-- RGB color matrix
-- raw, spatial, corrected, anchored, and encoded seam metrics
-- encoder and tuning options used for the run
-
-The diagnostics directory contains:
-
-- `01_reference_boundary.png`: boundary frame that the altered clip must match
-- `02_source_boundary.png`: original boundary frame from the altered clip
-- `03_source_warped.png`: source boundary after spatial alignment
-- `04_source_corrected.png`: source boundary after spatial and color correction
-- `05_output_boundary_encoded.png`: decoded boundary frame from the output video
-- `06_encoded_absdiff_amplified.png`: amplified absolute difference image
-
-## Tuning
-
-Start with the defaults. For most continuous-shot seams, `--anchor-frames 6` and
-`--crf 8` keep the boundary visually stable while limiting visible re-encoding
-loss.
-
-Increase `--ecc-width` if alignment is close but still visibly off. Decrease it
-for faster test runs.
-
-Increase `--mask-margin` when frame edges contain generation artifacts, black
-borders, watermarks, or partial objects that should not drive alignment.
-
-Lower `--trim-percentile` when the clips contain localized changes at the seam
-and the color solve is overfitting to those changing regions.
-
-Use `--no-full-refine` for faster previews. Keep full refinement enabled for the
-final output.
-
-Use `--anchor-frames 0` to inspect the pure affine and color correction without
-the exact residual seam ramp.
+and reports the seam error measured back from the encoded file. The JSON
+report records the same metrics plus the alignment model, dense-correspondence
+statistics, the fraction of the frame detected as changed content, blend
+windows, and every setting used.
 
 ## Troubleshooting
 
-If the tool reports that clip sizes or frame rates differ, normalize both clips
-with `ffmpeg` before running Seamstress.
-
-If ECC alignment fails, the boundary frames may not be similar enough for a
-continuous-shot correction. Try a larger `--mask-margin`, a larger `--ecc-width`,
-or a nearby cut point with less motion.
-
-If the seam is exact in diagnostics but not after encoding, lower `--crf`. H.264
-encoding and chroma subsampling can introduce small nonzero differences even
-when the unencoded anchored frame is an exact match.
-
-If the output path is the same as either input path, Seamstress exits instead of
-overwriting source media. Write to a new path and replace files manually only
-after reviewing the result.
+- **The report says `matrix_reverted`, `curves_reverted`, or
+  `field_reverted`.** That layer made the seam worse on this footage and was
+  disabled automatically — usually a sign the boundary frames barely
+  correspond (a real scene cut rather than a continuation).
+- **Low `valid_fraction` in the report.** The two boundary frames share
+  little content; Seamstress falls back toward global-only correction. Check
+  that the clips really are adjacent generations of the same shot.
+- **Banding or blocking near the seam after your NLE re-exports.** Seamstress
+  itself dithers; keep your downstream export quality high (CRF <= 16) to
+  preserve it.
+- **Odd-dimension reference clip.** Re-export it with even width and height;
+  yuv420p encoding requires it.
