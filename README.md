@@ -233,17 +233,20 @@ How it works:
    spatially-varying displacement field per flagged transition, so pops that
    are not a single global transform (for example a stretch that varies across
    the frame) are measured correctly.
-3. Warps displaced frames back onto the interpolated trajectory (geometric
-   pops), or rebuilds broken frames from their neighbors with
-   motion-compensated interpolation (stutters and content jumps). A short ramp
-   spreads any leftover step so corrections vanish at the window edges, and
-   the rendered output is re-measured at each repaired boundary against the
+3. Warps displaced frames back onto the clean trajectory. A pop-in/pop-out
+   pair around a rigidly displaced span is corrected with a single constant
+   field, iterated to convergence against both clean anchors, so frames
+   outside the span are not warped at all. Other anomalies use an
+   interpolated trajectory whose corrections ramp to zero at the window
+   edges, and broken frames (stutters, content jumps) are rebuilt from their
+   neighbors with motion-compensated interpolation.
+4. Re-measures the rendered output at each repaired boundary against the
    clip's own clean transitions.
-4. Re-encodes with the same size, frame rate, and audio. Frames outside repair
+5. Re-encodes with the same size, frame rate, and audio. Frames outside repair
    windows pass through unmodified, editorial hard cuts are recognized and
    left alone, and residual anomalies below a small pixel floor are not
    "repaired" at all. If nothing needs fixing the output is a lossless remux.
-5. Re-analyzes the rendered output and reports the before/after anomaly scores
+6. Re-analyzes the rendered output and reports the before/after anomaly scores
    per event.
 
 Use `--detect-only` to inspect findings without rendering, `--sensitivity` to

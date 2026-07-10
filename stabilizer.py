@@ -436,17 +436,25 @@ def field_between(gray_a, gray_b, width: int, height: int):
 
 
 def static_drift(gray_a, gray_b, width: int, height: int) -> float | None:
-    tracked = track_points(gray_a, gray_b)
-    if tracked is None:
+    rows, cols = 10, 6
+    cell_h, cell_w = height // rows, width // cols
+    window = cv2.createHanningWindow((cell_w, cell_h), cv2.CV_32F)
+    shifts = []
+    for r in range(rows):
+        for c in range(cols):
+            y0, x0 = r * cell_h, c * cell_w
+            cell_a = gray_a[y0 : y0 + cell_h, x0 : x0 + cell_w].astype(np.float32)
+            if float(cell_a.std()) < 4.0:
+                continue
+            cell_b = gray_b[y0 : y0 + cell_h, x0 : x0 + cell_w].astype(np.float32)
+            (dx, dy), response = cv2.phaseCorrelate(cell_a, cell_b, window)
+            if response < 0.1 or math.hypot(dx, dy) > 24.0:
+                continue
+            shifts.append((dx, dy))
+    if len(shifts) < 8:
         return None
-    src, dst = tracked
-    fitted = fit_field(src, dst, width, height)
-    if fitted is None:
-        return None
-    coeffs, inliers = fitted
-    design = poly_design(src[inliers, 0], src[inliers, 1], width, height)
-    field = np.linalg.norm(design @ coeffs, axis=1)
-    return float(np.percentile(field, 95))
+    median = np.median(np.array(shifts, dtype=np.float64), axis=0)
+    return float(math.hypot(median[0], median[1]))
 
 
 def field_max_displacement(coeffs, width: int, height: int, margin: float = 0.0) -> float:
@@ -487,16 +495,180 @@ def affine_field_coeffs(vec, width: int, height: int):
     return coeffs
 
 
+def cell_shift_field(
+    anchor_in,
+    warped_in,
+    warped_out,
+    anchor_out,
+    static,
+    width: int,
+    height: int,
+):
+    rows, cols = 10, 6
+    cell_h, cell_w = height // rows, width // cols
+    window = cv2.createHanningWindow((cell_w, cell_h), cv2.CV_32F)
+    points = []
+    shifts = []
+    for r in range(rows):
+        for c in range(cols):
+            y0, x0 = r * cell_h, c * cell_w
+            if static[y0 : y0 + cell_h, x0 : x0 + cell_w].mean() < 0.65:
+                continue
+            cell_a_in = anchor_in[y0 : y0 + cell_h, x0 : x0 + cell_w].astype(np.float32)
+            if float(cell_a_in.std()) < 4.0:
+                continue
+            cell_w_in = warped_in[y0 : y0 + cell_h, x0 : x0 + cell_w].astype(np.float32)
+            cell_w_out = warped_out[y0 : y0 + cell_h, x0 : x0 + cell_w].astype(np.float32)
+            cell_a_out = anchor_out[y0 : y0 + cell_h, x0 : x0 + cell_w].astype(np.float32)
+            (ex, ey), enter_response = cv2.phaseCorrelate(cell_a_in, cell_w_in, window)
+            (lx, ly), leave_response = cv2.phaseCorrelate(cell_w_out, cell_a_out, window)
+            if enter_response < 0.1 or leave_response < 0.1:
+                continue
+            dx, dy = (ex - lx) / 2.0, (ey - ly) / 2.0
+            if math.hypot(dx, dy) > 6.0:
+                continue
+            points.append((x0 + cell_w / 2.0, y0 + cell_h / 2.0))
+            shifts.append((dx, dy))
+    if len(points) < 8:
+        return None
+    points = np.array(points, dtype=np.float64)
+    shifts = np.array(shifts, dtype=np.float64)
+    design = poly_design(points[:, 0], points[:, 1], width, height)
+    coeffs, *_ = np.linalg.lstsq(design, shifts, rcond=None)
+    return coeffs
+
+
+def plan_constant_corrections(
+    clip: Path,
+    info: VideoInfo,
+    windows: list[tuple[int, int, list[GlitchEvent]]],
+    transitions: list[Transition],
+    stats: dict,
+    replaced_frames: set[int],
+) -> list[dict | None]:
+    plans: list[dict | None] = [None] * len(windows)
+    specs: list[tuple[int, int, int]] = []
+    needed: set[int] = set()
+    for i, (w0, w1, window_events) in enumerate(windows):
+        anomalous = sorted(
+            {t for event in window_events if event.repair == "warp" for t in event.transitions}
+        )
+        if len(anomalous) != 2:
+            continue
+        t_in, t_out = anomalous
+        if t_out - t_in < 2:
+            continue
+        interior = range(t_in + 1, t_out)
+        if any(not transitions[t - 1].ok for t in interior):
+            continue
+        if any(stats["z_geo"][t - 1] > 3.0 for t in interior):
+            continue
+        if not any(
+            transitions[t - 1].ok and t not in (t_in, t_out)
+            for t in range(w0, w1 + 1)
+        ):
+            continue
+        specs.append((i, t_in, t_out))
+        needed.update((t_in - 1, t_in, t_out - 1, t_out))
+    if not specs:
+        return plans
+
+    grays: dict[int, "np.ndarray"] = {}
+    for idx, frame in enumerate(decode_rgb_frames(clip, info)):
+        if idx in needed:
+            grays[idx] = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        if len(grays) == len(needed):
+            break
+
+    for i, t_in, t_out in specs:
+        w0, w1, _ = windows[i]
+        if any(f not in grays for f in (t_in - 1, t_in, t_out - 1, t_out)):
+            continue
+        clean_vecs = [
+            transitions[t - 1].vec
+            for t in range(w0, w1 + 1)
+            if transitions[t - 1].ok and t not in (t_in, t_out)
+        ]
+        typical = tuple(np.median(np.array(clean_vecs, dtype=np.float64), axis=0))
+
+        direct = estimate_transition(grays[t_in], grays[t_out - 1], t_out - 1, 1.0)
+        if not direct.ok or direct.inlier_ratio < 0.25:
+            continue
+        expected = np.eye(3)
+        for _ in range(t_in, t_out - 1):
+            expected = xf_matrix(typical) @ expected
+        drift = xf_vec(xf_matrix(direct.vec) @ np.linalg.inv(expected))
+        if xf_displacement(drift, info.width, info.height) > 1.0:
+            continue
+
+        field_in = field_between(grays[t_in - 1], grays[t_in], info.width, info.height)
+        field_out = field_between(grays[t_out - 1], grays[t_out], info.width, info.height)
+        if field_in is None or field_out is None:
+            continue
+        hat = affine_field_coeffs(typical, info.width, info.height)
+        mismatch = field_max_displacement(
+            field_in + field_out - 2.0 * hat, info.width, info.height, margin=0.08
+        )
+        if mismatch > 3.0:
+            continue
+
+        static = (
+            cv2.absdiff(grays[t_in - 1], grays[t_out]) < 6
+        ).astype(np.float32)
+        correction = (field_in - field_out) / 2.0
+        step = None
+        xs, ys = np.meshgrid(
+            np.arange(info.width, dtype=np.float32),
+            np.arange(info.height, dtype=np.float32),
+        )
+        for _ in range(5):
+            disp_x, disp_y = field_disp_maps(correction, info.width, info.height)
+            warped_in = cv2.remap(
+                grays[t_in], xs + disp_x, ys + disp_y,
+                cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE,
+            )
+            warped_out = cv2.remap(
+                grays[t_out - 1], xs + disp_x, ys + disp_y,
+                cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE,
+            )
+            delta = cell_shift_field(
+                grays[t_in - 1],
+                warped_in,
+                warped_out,
+                grays[t_out],
+                static,
+                info.width,
+                info.height,
+            )
+            if delta is None:
+                break
+            step = field_max_displacement(delta, info.width, info.height, margin=0.08)
+            correction = correction + delta
+            if step < 0.15:
+                break
+        if step is None or step > 1.5:
+            continue
+        if field_max_displacement(correction, info.width, info.height) < MIN_CORRECTION_PX:
+            continue
+        plans[i] = {
+            f: correction for f in range(t_in, t_out) if f not in replaced_frames
+        }
+    return plans
+
+
 def plan_field_corrections(
     clip: Path,
     info: VideoInfo,
     windows: list[tuple[int, int, list[GlitchEvent]]],
     transitions: list[Transition],
     replaced_frames: set[int],
+    skip: set[int] | None = None,
 ) -> list[dict]:
     specs: list[tuple[int, list[int]]] = []
     needed: set[int] = set()
     for i, window in enumerate(windows):
+        if skip and i in skip:
+            continue
         anomalous = sorted(
             {t for event in window[2] if event.repair == "warp" for t in event.transitions}
         )
@@ -1286,8 +1458,11 @@ What the tool does:
      duplicate/stutter frames, and content jumps.
   3. Re-estimates flagged transitions at full resolution and anchors each
      glitch window with a direct registration across it.
-  4. Warps displaced frames back onto the interpolated trajectory, or rebuilds
-     broken frames by motion-compensated interpolation of their neighbors.
+  4. Corrects a rigidly displaced span with one constant warp iterated to
+     convergence against the clean frames around it (frames outside the span
+     stay untouched); other displaced frames are warped onto the interpolated
+     trajectory, and broken frames are rebuilt by motion-compensated
+     interpolation of their neighbors.
   5. Re-encodes with the same size, frame rate, and audio; untouched frames
      pass through unmodified. If nothing is detected, the clip is remuxed
      losslessly.
@@ -1540,15 +1715,38 @@ def run(args: argparse.Namespace) -> int:
         )
 
     field_map: dict[int, "np.ndarray"] = {}
-    field_plans = (
-        plan_field_corrections(clip, info, windows, transitions, replaced_frames)
-        if not args.detect_only
-        else [{} for _ in windows]
-    )
+    if not args.detect_only:
+        constant_plans = plan_constant_corrections(
+            clip, info, windows, transitions, stats, replaced_frames
+        )
+        constant_indices = {i for i, plan in enumerate(constant_plans) if plan}
+        field_plans = plan_field_corrections(
+            clip, info, windows, transitions, replaced_frames, skip=constant_indices
+        )
+    else:
+        constant_plans = [None for _ in windows]
+        constant_indices = set()
+        field_plans = [{} for _ in windows]
 
     warp_map: dict[int, tuple] = {}
     excluded_knots = {t for event in events for t in event.transitions}
-    for window, window_fields in zip(windows, field_plans):
+    for i, (window, window_fields) in enumerate(zip(windows, field_plans)):
+        if i in constant_indices:
+            corrections = constant_plans[i]
+            peak = max(
+                field_max_displacement(c, info.width, info.height)
+                for c in corrections.values()
+            )
+            if peak < MIN_EVENT_CORRECTION_PX:
+                below_floor(window, peak)
+                continue
+            frames = sorted(corrections)
+            print(
+                f"mode:       frames {frames[0]}-{frames[-1]} corrected as a rigid "
+                "displaced segment; frames outside it are untouched"
+            )
+            field_map.update(corrections)
+            continue
         corrections = window_warp_corrections(
             transitions, window, replaced_frames, info, excluded_knots
         )
