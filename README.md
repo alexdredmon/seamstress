@@ -11,6 +11,9 @@ The tool has one CLI entrypoint:
 ./seamstress.py PREVIOUS_CLIP NEXT_CLIP [options]
 ```
 
+The repository also ships [Stabilizer](#stabilizer), a companion tool that
+repairs brief glitches inside a single clip.
+
 `PREVIOUS_CLIP` is the earlier clip in the timeline. `NEXT_CLIP` is the later
 clip in the timeline.
 
@@ -195,3 +198,55 @@ when the unencoded anchored frame is an exact match.
 If the output path is the same as either input path, Seamstress exits instead of
 overwriting source media. Write to a new path and replace files manually only
 after reviewing the result.
+
+## Stabilizer
+
+`stabilizer.py` repairs brief glitches inside a single clip: sudden scale,
+stretch, or position pops, stutter/duplicate frames, and frame jumps that break
+an otherwise smooth shot. It shares Seamstress's requirements (ffmpeg, ffprobe,
+and the Python dependencies from `requirements.txt`).
+
+```sh
+./stabilizer.py CLIP [options]
+```
+
+By default it scans the whole clip and writes `CLIP_stabilized.mp4`, a
+`_report.json` with detections and repair metrics, and a `_diagnostics`
+directory containing motion-trace CSVs and before/after PNGs of repaired
+frames. Point it at known trouble spots (in seconds) to scan only there with a
+more sensitive threshold:
+
+```sh
+./stabilizer.py clip.mp4 --range 7.5:9.5
+./stabilizer.py clip.mp4 --at 8.4
+```
+
+How it works:
+
+1. Estimates full-affine global motion between every consecutive frame pair
+   and flags transitions whose motion spikes away from the local trajectory,
+   plus duplicate frames and content jumps. Clips that animate on held frames
+   (a duplicated-frame cadence) are recognized so the cadence itself is not
+   flagged.
+2. Re-estimates flagged transitions at full resolution, anchors each glitch
+   window with a direct registration across it, and fits a robust
+   spatially-varying displacement field per flagged transition, so pops that
+   are not a single global transform (for example a stretch that varies across
+   the frame) are measured correctly.
+3. Warps displaced frames back onto the interpolated trajectory (geometric
+   pops), or rebuilds broken frames from their neighbors with
+   motion-compensated interpolation (stutters and content jumps). A short ramp
+   spreads any leftover step so corrections vanish at the window edges, and
+   the rendered output is re-measured at each repaired boundary against the
+   clip's own clean transitions.
+4. Re-encodes with the same size, frame rate, and audio. Frames outside repair
+   windows pass through unmodified, editorial hard cuts are recognized and
+   left alone, and residual anomalies below a small pixel floor are not
+   "repaired" at all. If nothing needs fixing the output is a lossless remux.
+5. Re-analyzes the rendered output and reports the before/after anomaly scores
+   per event.
+
+Use `--detect-only` to inspect findings without rendering, `--sensitivity` to
+tune detection, `--repair {auto,warp,interp}` to force a strategy, and
+`--crf`/`--preset` to control encoding. Run `./stabilizer.py --help` for the
+full option list.
